@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 from scipy.interpolate import griddata, interp1d
+from scipy.ndimage import uniform_filter
 from scipy.stats import linregress
 from shapely.geometry import (
     GeometryCollection,
@@ -47,6 +48,37 @@ def load_cruise_datasets(cruise, transect_name, variable_metadata):
     return datasets_by_type
 
 
+def bin_profile(P, V, depth_grid):
+    """
+    Bin-average V onto depth_grid using bins centred on each grid point.
+    Empty bins are returned as NaN.
+    """
+    dz = np.diff(depth_grid)
+    edges = np.concatenate((
+        [depth_grid[0] - dz[0] / 2],
+        depth_grid[:-1] + dz / 2,
+        [depth_grid[-1] + dz[-1] / 2],
+    ))
+    sums, _ = np.histogram(P, bins=edges, weights=V)
+    counts, _ = np.histogram(P, bins=edges)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return sums / counts
+
+
+def nan_uniform_filter(data, size):
+    """
+    Moving-average smoothing that ignores NaNs (NaN cells stay NaN).
+    """
+    valid = np.isfinite(data)
+    filled = np.where(valid, data, 0.0)
+    num = uniform_filter(filled, size=size, mode="nearest")
+    den = uniform_filter(valid.astype(float), size=size, mode="nearest")
+    with np.errstate(invalid="ignore", divide="ignore"):
+        out = num / den
+    out[~valid] = np.nan
+    return out
+
+
 def build_profile_matrix(
     datasets,
     var,
@@ -55,7 +87,17 @@ def build_profile_matrix(
     do_interpolate=True,
     extrapolate=True,
     ignore_questionable=True,
+    do_bin=True,
 ):
+    """
+    Build a (depth, profile) matrix for `var`, with columns in the order of
+    `datasets`.
+
+    do_bin: bin-average the raw samples onto depth_grid. If do_interpolate is
+        also True, empty bins inside the sampled range are filled linearly.
+    do_interpolate (without do_bin): linearly interpolate raw samples onto
+        depth_grid.
+    """
     profiles = np.full((len(depth_grid), len(datasets)), np.nan)
 
     for i, ds in enumerate(datasets):
@@ -72,7 +114,8 @@ def build_profile_matrix(
                 continue
             SA = ds["SA"].values
             CT = ds["CT"].values
-            V = gsw.pot_rho_t_exact(SA, CT, P, 0)
+            # potential density anomaly (rho - 1000) referenced to 0 dbar
+            V = gsw.sigma0(SA, CT)
         else:
             V = ds[var].values
             if var == "O2":
@@ -99,7 +142,17 @@ def build_profile_matrix(
         if P.size < 2:
             continue
 
-        if do_interpolate:
+        if do_bin:
+            binned = bin_profile(P, V, depth_grid)
+            if do_interpolate:
+                good = np.isfinite(binned)
+                if good.sum() >= 2:
+                    binned = np.interp(
+                        depth_grid, depth_grid[good], binned[good],
+                        left=np.nan, right=np.nan,
+                    )
+            profiles[:, i] = binned
+        elif do_interpolate:
             f = interp1d(P, V, kind="linear", bounds_error=False)
             profiles[:, i] = f(depth_grid)
         else:
@@ -140,8 +193,17 @@ def plot_sections_grid(
     include_topo=True,
     use_density_contours=True,
     coast_lon=None,
-    coast_lat=None, 
+    coast_lat=None,
+    do_bin=True,
+    rho_smooth_size=(3, 1),
+    rho_levels=np.arange(21, 27.25, 0.25),
+    rho_bold_levels=(26,),
 ):
+    """
+    rho_smooth_size: (depth bins, stations) moving-average window applied to
+        the density field before contouring only; None disables smoothing.
+    rho_levels / rho_bold_levels: sigma0 contour levels (kg/m^3 - 1000).
+    """
     variable_metadata = load_variable_metadata(metadata_path)
 
     nrows = len(cruises)
@@ -157,63 +219,81 @@ def plot_sections_grid(
         constrained_layout=True,
     )
 
-    depth_grid = np.linspace(5, depth_limit, depth_limit)
+    # 1 m depth grid
+    depth_grid = np.arange(5, depth_limit + 1, 1.0)
 
     for r, cruise in enumerate(cruises):
         datasets_by_type = load_cruise_datasets(cruise, transect_name, variable_metadata)
 
-        # Use CTD profiles to define distance and (optionally) topography
+        # Use CTD profiles to define topography and density contours
         ctd_datasets = datasets_by_type.get("ctd", [])
         if len(ctd_datasets) == 0:
             continue
 
-        # Assumes you already split these out:
-        # - calc_cross_shore_distance(...) -> geometry only
-        # - extract_transect_bathymetry(...) -> topo only
-        geom = calc_cross_shore_distance(ctd_datasets, coast_lon, coast_lat)
-        distance = geom["distance"]
-        profile_lats = geom["profile_lats"]
-        profile_lons = geom["profile_lons"]
+        # Geometry per dataset type: each type gets its own inshore -> offshore
+        # ordering and distances, so sections don't rely on files lining up
+        geom_by_type = {}
+        for data_type, type_datasets in datasets_by_type.items():
+            if len(type_datasets) < 2:
+                continue
+            try:
+                geom_by_type[data_type] = calc_cross_shore_distance(
+                    type_datasets, coast_lon, coast_lat
+                )
+            except (ValueError, AttributeError, KeyError) as e:
+                print(f"{cruise} {data_type}: could not compute distance ({e})")
+
+        ctd_geom = geom_by_type.get("ctd")
+        if ctd_geom is None:
+            continue
+        ctd_distance = ctd_geom["distance"]
 
         transect_depths = None
         if include_topo:
             transect_depths = extract_transect_bathymetry(
-                profile_lons=profile_lons,
-                profile_lats=profile_lats,
+                profile_lons=ctd_geom["profile_lons"],
+                profile_lats=ctd_geom["profile_lats"],
                 region=[-3, 2, 2, 7],   # change if needed
                 depth_jump_threshold=150,
             )
 
-        # density contours from CTD, once per cruise
+        # density contours from CTD, once per cruise, on the CTD's own grid;
+        # drawn identically on every panel regardless of the panel's grid
         if use_density_contours:
             rho_profiles = build_profile_matrix(
-                ctd_datasets,
+                ctd_geom["datasets"],
                 "rho",
                 depth_grid,
                 variable_metadata,
                 do_interpolate=do_interpolate,
                 extrapolate=extrapolate,
                 ignore_questionable=ignore_questionable,
+                do_bin=do_bin,
             )
+            if rho_smooth_size is not None:
+                rho_profiles = nan_uniform_filter(rho_profiles, rho_smooth_size)
+            X_rho, Y_rho = np.meshgrid(ctd_distance, depth_grid)
+            rho_contour_data = np.ma.masked_invalid(rho_profiles)
 
         for c, var in enumerate(variables):
             ax = axs[r, c]
             meta = variable_metadata[var]
             data_type = meta["dataset"]
 
-            datasets = datasets_by_type.get(data_type, [])
-            if len(datasets) == 0:
+            geom = geom_by_type.get(data_type)
+            if geom is None:
                 ax.set_axis_off()
                 continue
 
             profiles = build_profile_matrix(
-                datasets,
+                geom["datasets"],
                 var,
                 depth_grid,
                 variable_metadata,
                 do_interpolate=do_interpolate,
                 extrapolate=extrapolate,
                 ignore_questionable=ignore_questionable,
+                do_bin=do_bin,
             )
 
             # color limits from metadata JSON
@@ -225,7 +305,7 @@ def plot_sections_grid(
                 vmin = np.log10(max(vmin, 1e-3))
                 vmax = np.log10(max(vmax, 1e-3))
 
-            X, Y = np.meshgrid(distance, depth_grid)
+            X, Y = np.meshgrid(geom["distance"], depth_grid)
 
             mesh = ax.pcolormesh(
                 X,
@@ -240,21 +320,20 @@ def plot_sections_grid(
 
             # optional density contours
             if use_density_contours:
-                contour_data = np.ma.masked_invalid(rho_profiles)
                 cs = ax.contour(
-                    X,
-                    Y,
-                    contour_data,
+                    X_rho,
+                    Y_rho,
+                    rho_contour_data,
                     colors="black",
                     linewidths=0.5,
-                    levels=np.arange(1021, 1027.25, 0.25),
+                    levels=rho_levels,
                     zorder=2,
                 )
                 ax.contour(
-                    X,
-                    Y,
-                    contour_data,
-                    levels=[1026],
+                    X_rho,
+                    Y_rho,
+                    rho_contour_data,
+                    levels=list(rho_bold_levels),
                     colors="black",
                     linewidths=1.0,
                     zorder=3,
@@ -266,10 +345,10 @@ def plot_sections_grid(
                 if topo_arr[0] < 0:
                     topo_arr = -topo_arr
 
-                ax.plot(distance, topo_arr, color="k", linewidth=0.75, zorder=4)
+                ax.plot(ctd_distance, topo_arr, color="k", linewidth=0.75, zorder=4)
                 mask = np.isfinite(topo_arr)
                 ax.fill_between(
-                    distance[mask],
+                    ctd_distance[mask],
                     topo_arr[mask],
                     y2=depth_limit,
                     color="lightgray",
